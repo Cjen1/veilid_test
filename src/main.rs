@@ -1,8 +1,8 @@
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use veilid_core::VeilidUpdate::{AppMessage, Network};
 use veilid_core::{
-    VeilidConfigBlockStore, VeilidConfigInner, VeilidConfigProtectedStore, VeilidConfigTableStore,
-    VeilidUpdate,
+    DHTSchema, VeilidConfigBlockStore, VeilidConfigInner, VeilidConfigProtectedStore, VeilidConfigTableStore, VeilidUpdate
 };
 
 fn handle_update(update: VeilidUpdate) {
@@ -28,22 +28,22 @@ fn handle_update(update: VeilidUpdate) {
 
 fn noop_update(_update: VeilidUpdate) {}
 
-fn mk_config() -> VeilidConfigInner {
+fn mk_config(prefix: &str) -> VeilidConfigInner {
     return VeilidConfigInner {
         program_name: "TestDemoGetSet".into(),
         namespace: "veilid-example".into(),
         protected_store: VeilidConfigProtectedStore {
             // avoid prompting for password, don't do this in production
             always_use_insecure_storage: true,
-            directory: "./.veilid/block_store".into(),
+            directory: format!("./{}/.veilid/block_store", prefix),
             ..Default::default()
         },
         block_store: VeilidConfigBlockStore {
-            directory: "./.veilid/block_store".into(),
+            directory: format!("./{}/.veilid/block_store", prefix),
             ..Default::default()
         },
         table_store: VeilidConfigTableStore {
-            directory: "./.veilid/table_store".into(),
+            directory: format!("./{}/.veilid/table_store", prefix),
             ..Default::default()
         },
         ..Default::default()
@@ -53,27 +53,46 @@ fn mk_config() -> VeilidConfigInner {
 #[tokio::main]
 pub async fn keygen() {
     println!("Keygen");
-    let veilid = veilid_core::api_startup_config(Arc::new(noop_update), mk_config()).await.unwrap();
+    let veilid = veilid_core::api_startup_config(Arc::new(noop_update), mk_config("keygen"))
+        .await
+        .unwrap();
     let crypto_system = veilid.crypto().unwrap();
     let keypair = crypto_system.best().generate_keypair();
-    println!("Generated: {}", keypair);
+    println!("Generated: {} {}", keypair.secret, keypair.key);
     veilid.shutdown().await;
 }
 
 #[tokio::main]
-pub async fn server(key: String) {
-//    println!("Server");
-//
-//    let veilid = veilid_core::api_startup_config(UPDATE_CALLBACK, CONFIG)
-//        .await
-//        .unwrap();
-//    println!("Starting");
-//    veilid.attach().await.unwrap();
-//
-//    let routing_context = veilid.routing_context();
-//
-//    tokio::signal::ctrl_c().await.unwrap();
-//    veilid.shutdown().await;
+pub async fn server(pubkey: &String, privk: &String) {
+    println!("Server");
+
+    let keypair = veilid_core::KeyPair::new(pubkey, privk);
+
+    let veilid = veilid_core::api_startup_config(Arc::new(handle_update), mk_config("server"))
+        .await
+        .unwrap();
+    veilid.attach().await.unwrap();
+
+    let routing_context = veilid.routing_context().unwrap();
+
+    let schema = DHTSchema::smpl(0, vec![veilid_core::DHTSchemaSMPLMember{m_key: keypair.secret, m_cnt: 1}]).unwrap();
+
+    // No owner key passed => only schema members can write
+    let record = routing_context.create_dht_record(schema, None, None).await.unwrap();
+    println!("Record key is: {}", record.key());
+
+    routing_context.close_dht_record(*record.key()).await;
+
+    routing_context.open_dht_record(*record.key(), Some(keypair));
+
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut buffer = Vec::new();
+    reader.read_until(b'\n', &mut buffer).await.unwrap();
+    routing_context.set_dht_value(*record.key(), 0, buffer, None);
+    routing_context.close_dht_record(*record.key());
+
+    tokio::signal::ctrl_c().await.unwrap();
+    veilid.shutdown().await;
 }
 
 use clap::{Parser, Subcommand};
@@ -91,11 +110,13 @@ enum Commands {
     Keygen,
     Server {
         #[arg(short, long, required = true)]
-        key: String,
+        pubkey: String,
+        #[arg(short, long, required = true)]
+        privk: String,
     },
     Client {
         #[arg(short, long, required = true)]
-        key: String,
+        dhtkey: String,
     },
 }
 
@@ -106,7 +127,7 @@ fn main() {
         Commands::Keygen => {
             keygen();
         }
-        Commands::Server { key } => todo!(),
-        Commands::Client { key } => todo!(),
+        Commands::Server { pubkey, privk } => server(pubkey, privk),
+        Commands::Client { dhtkey } => todo!(),
     }
 }
